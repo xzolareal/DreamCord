@@ -1,0 +1,52 @@
+{
+  "name": "dreamcord",
+  "version": "0.2.0",
+  "description": "DreamCord - Mod Discord simple avec fond d'écran animé (image / vidéo) pour Windows",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "inject": "node src/main/injector.js inject",
+    "uninject": "node src/main/injector.js uninject",
+    "build": "electron-builder --win"
+  },
+  "keywords": [
+    "discord",
+    "electron",
+    "client",
+    "customization",
+    "wallpaper",
+    "live-wallpaper"
+  ],
+  "author": "DreamCord",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.dreamcord.app",
+    "productName": "DreamCord",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
