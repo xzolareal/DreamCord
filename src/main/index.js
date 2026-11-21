@@ -15,17 +15,14 @@ const config = common.getConfig();
 
 if (config.window.hardwareAcceleration === false) {
   app.disableHardwareAcceleration();
-} else {
-  // Rendu GPU plus fluide pour la vidéo de fond
-  app.commandLine.appendSwitch('enable-gpu-rasterization');
-  app.commandLine.appendSwitch('enable-zero-copy');
 }
 
-if (!app.requestSingleInstanceLock()) {
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (!mainWindow) return;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
@@ -33,16 +30,23 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 function getIconPath() {
+  const custom = common.getConfig().window?.iconPath;
+  if (custom && fs.existsSync(custom)) return custom;
   const p = path.join(__dirname, '../../assets/icon.png');
   return fs.existsSync(p) ? p : null;
+}
+
+function showAndFocusWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 function setupNetworkHooks() {
   const ses = session.defaultSession;
 
-  ses.webRequest.onHeadersReceived((details, callback) => {
-    callback({ responseHeaders: common.stripCsp(details.responseHeaders) });
-  });
+  common.installCspHook(ses);
 
   const TELEMETRY = ['/api/v9/science', '/api/v10/science', '/api/v9/metrics', '/api/v10/metrics', 'sentry.io'];
   ses.webRequest.onBeforeRequest({ urls: ['*://*.discord.com/*', '*://*.sentry.io/*'] }, (details, callback) => {
@@ -53,8 +57,17 @@ function setupNetworkHooks() {
     callback({ cancel: false });
   });
 
+  const ALLOWED_PERMS = new Set([
+    'media',
+    'mediaKeySystem',
+    'notifications',
+    'fullscreen',
+    'clipboard-read',
+    'clipboard-sanitized-write',
+    'display-capture'
+  ]);
   ses.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(['media', 'mediaKeySystem', 'notifications', 'fullscreen', 'clipboard-read', 'display-capture'].includes(permission));
+    callback(ALLOWED_PERMS.has(permission));
   });
 
   ses.setDisplayMediaRequestHandler(async (_request, callback) => {
@@ -69,34 +82,37 @@ function setupNetworkHooks() {
 
 function createTray() {
   const iconPath = getIconPath();
-  tray = new Tray(iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty());
+  const img = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+  tray = new Tray(img && !img.isEmpty() ? img : nativeImage.createEmpty());
   tray.setToolTip('DreamCord');
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: 'Afficher DreamCord', click: () => mainWindow && (mainWindow.show(), mainWindow.focus()) },
+      { label: 'Afficher DreamCord', click: showAndFocusWindow },
       {
         label: 'Réglages (F9)',
         click: () => {
-          if (!mainWindow) return;
-          mainWindow.show();
+          if (!mainWindow || mainWindow.isDestroyed()) return;
+          showAndFocusWindow();
           mainWindow.webContents.executeJavaScript('window.__DREAMCORD_TOGGLE_STUDIO__&&window.__DREAMCORD_TOGGLE_STUDIO__()', true).catch(() => {});
         }
       },
       { type: 'separator' },
-      { label: 'Quitter', click: () => ((isQuitting = true), app.quit()) }
+      {
+        label: 'Quitter',
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        }
+      }
     ])
   );
-  tray.on('click', () => {
-    if (!mainWindow) return;
-    if (mainWindow.isVisible()) mainWindow.focus();
-    else mainWindow.show();
-  });
+  tray.on('click', showAndFocusWindow);
 }
 
 function createWindow() {
   ensureDirectories();
   const cfg = common.getConfig();
-  const material = cfg.window.material || 'none';
+  const supportedMaterial = common.resolveSupportedMaterial(cfg.window.material || 'none');
 
   mainWindow = new BrowserWindow({
     width: cfg.window.width || 1320,
@@ -106,9 +122,11 @@ function createWindow() {
     title: 'DreamCord',
     icon: getIconPath() || undefined,
     show: false,
-    backgroundColor: material === 'none' ? '#05050a' : '#00000000',
+    backgroundColor: supportedMaterial === 'none' ? '#09090b' : '#00000000',
     titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#00000000', symbolColor: '#e4e4e7', height: 32 },
+    ...(process.platform === 'win32'
+      ? { titleBarOverlay: { color: '#00000000', symbolColor: '#e4e4e7', height: 32 } }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -118,19 +136,23 @@ function createWindow() {
     }
   });
   const wc = mainWindow.webContents;
-  common.applyWindowMaterial(mainWindow, material, true);
+  common.applyWindowMaterial(mainWindow, supportedMaterial, true);
+  if (cfg.window.iconPath) {
+    common.applyWindowIcon(mainWindow, cfg.window.iconPath);
+  }
+  common.applyTaskbarBadge(mainWindow, Boolean(cfg.window.hideTaskbarBadge));
 
   wc.setWindowOpenHandler(({ url }) => {
-    if (/^https:\/\/(ptb\.|canary\.)?discord\.com/.test(url)) return { action: 'allow' };
-    shell.openExternal(url);
+    if (/^https:\/\/(ptb\.|canary\.)?discord(app)?\.com/i.test(url)) return { action: 'allow' };
+    if (/^(https?:|mailto:)/i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
 
   wc.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') return;
+    if (input.type !== 'keyDown' || input.isAutoRepeat || input.meta) return;
     const isF9 = input.key === 'F9' && !input.control && !input.alt && !input.shift;
     const isCtrlAltD = input.control && input.alt && !input.shift && input.key.toLowerCase() === 'd';
-    const isDevTools = input.control && input.shift && input.key.toLowerCase() === 'i';
+    const isDevTools = input.control && input.shift && !input.alt && input.key.toLowerCase() === 'i';
     if (isF9 || isCtrlAltD) {
       event.preventDefault();
       wc.executeJavaScript('window.__DREAMCORD_TOGGLE_STUDIO__&&window.__DREAMCORD_TOGGLE_STUDIO__()', true).catch(() => {});
@@ -140,28 +162,60 @@ function createWindow() {
     }
   });
 
-  mainWindow.once('ready-to-show', () => {
+  let shown = false;
+  let showFallbackTimer = null;
+  const revealWindow = () => {
+    if (shown || !mainWindow || mainWindow.isDestroyed()) return;
+    shown = true;
+    if (showFallbackTimer) {
+      clearTimeout(showFallbackTimer);
+      showFallbackTimer = null;
+    }
     if (!cfg.window.startMinimized) {
       mainWindow.show();
       mainWindow.focus();
     }
-  });
+  };
+  mainWindow.once('ready-to-show', revealWindow);
+  if (!cfg.window.startMinimized) {
+    showFallbackTimer = setTimeout(revealWindow, 3000);
+  }
 
-  let injected = false;
+  let navGen = 0;
+  let injectedGen = -1;
+  let injectingGen = -1;
   const inject = async () => {
-    if (injected || mainWindow.isDestroyed()) return;
-    injected = true;
+    if (!mainWindow || mainWindow.isDestroyed() || wc.isDestroyed()) return;
+    if (!common.isDiscordUrl(wc.getURL())) return;
+    const gen = navGen;
+    if (injectedGen === gen || injectingGen === gen) return;
+    injectingGen = gen;
     try {
-      await wc.executeJavaScript(await common.buildPayload(), true);
+      const payload = await common.buildPayload();
+      if (!mainWindow || mainWindow.isDestroyed() || wc.isDestroyed() || navGen !== gen) return;
+      await wc.executeJavaScript(payload, true);
+      if (navGen === gen) injectedGen = gen;
+      if (!common.getConfig().plugins?.['window-opacity']) {
+        common.applyWindowOpacity(mainWindow, 1);
+      }
     } catch (err) {
-      injected = false;
       console.error('[DreamCord] Injection:', err);
+    } finally {
+      if (injectingGen === gen) injectingGen = -1;
     }
   };
-  wc.on('did-start-loading', () => (injected = false));
+  wc.on('did-start-loading', () => {
+    navGen += 1;
+  });
+  wc.on('render-process-gone', () => {
+    navGen += 1;
+  });
   wc.on('dom-ready', inject);
   wc.on('did-finish-load', inject);
-  wc.on('did-fail-load', (_e, code, desc, url) => console.error('[DreamCord] Échec chargement:', code, desc, url));
+  wc.on('did-fail-load', (_e, code, desc, url) => {
+    revealWindow();
+    console.error('[DreamCord] Échec chargement:', code, desc, url);
+  });
 
   // Taille de fenêtre : enregistrée une fois le redimensionnement terminé
   let resizeTimer = null;
@@ -184,24 +238,42 @@ function createWindow() {
     }
   });
 
+  mainWindow.on('closed', () => {
+    clearTimeout(resizeTimer);
+    if (showFallbackTimer) clearTimeout(showFallbackTimer);
+    mainWindow = null;
+  });
+
   mainWindow.loadURL('https://discord.com/app');
 }
 
-app.whenReady().then(() => {
-  try {
-    injectBranch('stable'); // injection automatique dans le Discord officiel s'il est installé
-  } catch {}
-  setupNetworkHooks();
-  common.registerIpc();
-  createTray();
-  createWindow();
-});
+if (gotSingleInstanceLock) {
+  app.whenReady().then(() => {
+    common.warmCache();
+    common.installTaskbarBadgeHook();
+    setupNetworkHooks();
+    common.registerIpc();
+    createTray();
+    createWindow();
+    // Injection différée dans le Discord officiel pour ne pas ralentir l'ouverture de la fenêtre
+    setTimeout(() => {
+      try {
+        injectBranch('stable');
+      } catch {}
+    }, 1500);
+  });
 
-app.on('before-quit', () => {
-  isQuitting = true;
-  common.flushConfig();
-});
+  app.on('before-quit', () => {
+    isQuitting = true;
+    common.flushConfig();
+    common.closeWallpaperServer();
+    if (tray && !tray.isDestroyed()) {
+      tray.destroy();
+      tray = null;
+    }
+  });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+}

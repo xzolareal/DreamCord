@@ -35,6 +35,7 @@ let port = 0;
 let starting = null;
 let current = null; // { filePath, mime }
 let generation = 0;
+
 // Seuls les fichiers choisis par l'utilisateur (ou enregistrés dans sa config) peuvent être servis.
 const allowed = new Set();
 const allow = (filePath) => {
@@ -61,7 +62,7 @@ function parseRange(header, size) {
   return { start, end };
 }
 
-function handler(req, res) {
+async function handler(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -80,25 +81,32 @@ function handler(req, res) {
     parts = new URL(req.url, 'http://127.0.0.1').pathname.split('/').filter(Boolean);
   } catch {}
 
-  if (!current || parts[0] !== TOKEN) {
+  const target = current;
+  if (!target || parts.length < 2 || parts[0] !== TOKEN) {
     res.writeHead(404);
     return res.end();
   }
 
   let stat;
   try {
-    stat = fs.statSync(current.filePath);
+    stat = await fs.promises.stat(target.filePath);
     if (!stat.isFile()) throw new Error('not a file');
   } catch {
-    res.writeHead(404);
-    return res.end();
+    if (!res.destroyed && !res.writableEnded) {
+      res.writeHead(404);
+      res.end();
+    }
+    return;
   }
+
+  if (req.destroyed || res.destroyed) return;
 
   const size = stat.size;
   const headers = {
-    'Content-Type': current.mime,
+    'Content-Type': target.mime,
     'Accept-Ranges': 'bytes',
-    'Cache-Control': 'no-cache',
+    // L'URL inclut déjà ?v=<mtime>&g=<gen> : le navigateur peut mettre en cache les segments vidéo en boucle
+    'Cache-Control': 'private, max-age=3600',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Private-Network': 'true',
     'Cross-Origin-Resource-Policy': 'cross-origin',
@@ -121,14 +129,20 @@ function handler(req, res) {
     headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
   }
 
-  headers['Content-Length'] = size === 0 ? 0 : end - start + 1;
+  const length = size === 0 ? 0 : end - start + 1;
+  headers['Content-Length'] = length;
   res.writeHead(status, headers);
 
   if (req.method === 'HEAD' || size === 0) return res.end();
 
-  const stream = fs.createReadStream(current.filePath, { start, end, highWaterMark: 1 << 20 });
-  stream.on('error', () => res.destroy());
-  res.on('close', () => stream.destroy());
+  const highWaterMark = Math.min(256 * 1024, Math.max(16 * 1024, length));
+  const stream = fs.createReadStream(target.filePath, { start, end, highWaterMark });
+  stream.on('error', () => {
+    if (!res.destroyed) res.destroy();
+  });
+  res.on('close', () => {
+    if (!stream.destroyed) stream.destroy();
+  });
   stream.pipe(res);
 }
 
@@ -136,9 +150,22 @@ function ensureServer() {
   if (server && port) return Promise.resolve();
   if (starting) return starting;
   const p = new Promise((resolve, reject) => {
-    const s = http.createServer(handler);
-    s.on('error', reject);
+    const s = http.createServer((req, res) => {
+      handler(req, res).catch(() => {
+        if (!res.destroyed && !res.writableEnded) {
+          try {
+            res.writeHead(500);
+            res.end();
+          } catch {}
+        }
+      });
+    });
+    const onStartupError = (err) => reject(err);
+    s.once('error', onStartupError);
+    s.keepAliveTimeout = 15000;
     s.listen(0, '127.0.0.1', () => {
+      s.removeListener('error', onStartupError);
+      s.on('error', () => {});
       server = s;
       port = s.address().port;
       s.unref(); // ne bloque jamais la fermeture de l'application
@@ -157,24 +184,35 @@ function ensureServer() {
   return p;
 }
 
+function closeServer() {
+  if (!server) return;
+  const s = server;
+  server = null;
+  port = 0;
+  try {
+    s.close();
+  } catch {}
+}
+
 // Prépare le fichier et renvoie l'URL locale à donner au <video> / <img>.
 async function serveFile(filePath) {
   if (typeof filePath !== 'string' || !filePath) return null;
-  const ext = path.extname(filePath).toLowerCase();
+  const resolved = path.resolve(filePath);
+  const ext = path.extname(resolved).toLowerCase();
   const mime = MIME[ext];
-  if (!mime || !allowed.has(path.resolve(filePath))) return null;
+  if (!mime || !allowed.has(resolved)) return null;
   let stat;
   try {
-    stat = fs.statSync(filePath);
+    stat = await fs.promises.stat(resolved);
   } catch {
     return null;
   }
   if (!stat.isFile()) return null;
 
   await ensureServer();
-  current = { filePath, mime };
+  current = { filePath: resolved, mime };
   generation += 1;
-  const name = encodeURIComponent(path.basename(filePath));
+  const name = encodeURIComponent(path.basename(resolved));
   return `http://127.0.0.1:${port}/${TOKEN}/${name}?v=${Math.floor(stat.mtimeMs)}&g=${generation}`;
 }
 
@@ -200,4 +238,4 @@ async function pickFile(win) {
   return { filePath, fileName: path.basename(filePath) };
 }
 
-module.exports = { serveFile, pickFile, allow, VIDEO_EXT, IMAGE_EXT };
+module.exports = { serveFile, pickFile, allow, closeServer, VIDEO_EXT, IMAGE_EXT };

@@ -17,6 +17,17 @@ function getPatchScriptPath() {
   return path.resolve(__dirname, 'discord-patch.js');
 }
 
+function compareAppDirsDesc(a, b) {
+  const pa = a.replace(/^app-/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = b.replace(/^app-/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (pb[i] || 0) - (pa[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return b.localeCompare(a);
+}
+
 function findCoreIndexFiles(branchFolder) {
   const localAppData = getLocalAppData();
   const baseDir = path.join(localAppData, branchFolder);
@@ -27,8 +38,7 @@ function findCoreIndexFiles(branchFolder) {
     const appDirs = fs
       .readdirSync(baseDir)
       .filter((d) => d.startsWith('app-'))
-      .sort()
-      .reverse();
+      .sort(compareAppDirsDesc);
 
     for (const appDir of appDirs) {
       const modulesDir = path.join(baseDir, appDir, 'modules');
@@ -88,18 +98,24 @@ function getInstallationsStatus() {
   return statuses;
 }
 
+function findTargetBranch(statuses, branchId) {
+  const exact = statuses.find((s) => s.id === branchId && s.installed);
+  if (exact) return exact;
+  return branchId === 'stable' ? statuses.find((s) => s.installed) : null;
+}
+
 function injectBranch(branchId = 'stable') {
   const statuses = getInstallationsStatus();
-  const target = statuses.find((s) => s.id === branchId) || statuses.find((s) => s.installed);
+  const target = findTargetBranch(statuses, branchId);
   if (!target || !target.installed) {
     return { ok: false, message: 'Aucune installation Discord détectée pour cette branche.' };
   }
 
-  const patchScript = getPatchScriptPath().replace(/\\/g, '\\\\');
+  const patchScriptLiteral = JSON.stringify(getPatchScriptPath());
   const payload = [
     '// --- DREAMCORD INJECTION START ---',
     'try {',
-    `  require("${patchScript}");`,
+    `  require(${patchScriptLiteral});`,
     '} catch (err) {',
     '  console.error("[DreamCord] Erreur démarrage patch:", err);',
     '}',
@@ -111,16 +127,13 @@ function injectBranch(branchId = 'stable') {
   try {
     for (const item of target.allTargets) {
       const backupPath = `${item.indexPath}.dreamcord.bak`;
-      if (!fs.existsSync(backupPath)) {
-        const current = fs.readFileSync(item.indexPath, 'utf8');
-        if (!current.includes('DREAMCORD INJECTION START')) {
-          fs.writeFileSync(backupPath, current, 'utf8');
-        }
-      }
       let current = '';
       try {
         current = fs.readFileSync(item.indexPath, 'utf8');
       } catch {}
+      if (!fs.existsSync(backupPath) && current && !current.includes('DREAMCORD INJECTION START')) {
+        fs.writeFileSync(backupPath, current, 'utf8');
+      }
       if (current !== payload) fs.writeFileSync(item.indexPath, payload, 'utf8');
     }
     return {
@@ -134,7 +147,7 @@ function injectBranch(branchId = 'stable') {
 
 function uninjectBranch(branchId = 'stable') {
   const statuses = getInstallationsStatus();
-  const target = statuses.find((s) => s.id === branchId) || statuses.find((s) => s.installed);
+  const target = findTargetBranch(statuses, branchId);
   if (!target || !target.installed) {
     return { ok: false, message: 'Aucune installation Discord trouvée.' };
   }
@@ -142,7 +155,16 @@ function uninjectBranch(branchId = 'stable') {
   try {
     for (const item of target.allTargets) {
       const backupPath = `${item.indexPath}.dreamcord.bak`;
-      fs.writeFileSync(item.indexPath, "module.exports = require('./core.asar');\n", 'utf8');
+      let restoreContent = "module.exports = require('./core.asar');\n";
+      if (fs.existsSync(backupPath)) {
+        try {
+          const bak = fs.readFileSync(backupPath, 'utf8');
+          if (bak && !bak.includes('DREAMCORD INJECTION START')) {
+            restoreContent = bak;
+          }
+        } catch {}
+      }
+      fs.writeFileSync(item.indexPath, restoreContent, 'utf8');
       if (fs.existsSync(backupPath)) {
         fs.unlinkSync(backupPath);
       }

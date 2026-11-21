@@ -1,6 +1,6 @@
 {
   "name": "dreamcord",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DreamCord - Mod Discord simple avec fond d'écran animé (image / vidéo) pour Windows",
   "main": "src/main/index.js",
   "scripts": {
@@ -40,7 +40,7 @@
         "nsis",
         "portable"
       ],
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.ico"
     },
     "nsis": {
       "oneClick": false,

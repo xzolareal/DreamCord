@@ -11,31 +11,35 @@ const { app, BrowserWindow, session } = electron;
 const LOG_FILE = path.join(getPaths().userData, 'patch.log');
 function logPatch(msg) {
   try {
-    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`, 'utf8');
+    fs.appendFile(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`, 'utf8', () => {});
   } catch {}
 }
 common.state.log = logPatch;
 
 try {
   ensureDirectories();
-  fs.writeFileSync(LOG_FILE, `[${new Date().toISOString()}] DreamCord chargé\n`, 'utf8');
+  fs.writeFile(LOG_FILE, `[${new Date().toISOString()}] DreamCord chargé\n`, 'utf8', () => {});
 } catch {}
+
+// Préchauffe la config + sources renderer + serveur fond d'écran avant le dom-ready
+common.warmCache();
+common.installTaskbarBadgeHook();
 
 const patchedWindows = new WeakSet();
 const patchedSessions = new WeakSet();
-const injected = new WeakSet(); // webContents déjà injectés pour la page courante
-const injecting = new WeakSet();
+const injectedGen = new WeakMap(); // webContents -> dernière génération injectée
+const injectingGen = new WeakMap(); // webContents -> génération en cours d'injection
+const navGen = new WeakMap(); // webContents -> compteur de navigation courante
+const consoleHandlers = new WeakMap(); // webContents -> listener console de secours
 
-function isDiscordUrl(url) {
-  if (typeof url !== 'string' || !url.includes('discord.com')) return false;
-  try {
-    const u = new URL(url);
-    if (!/(^|\.)discord(app)?\.com$/i.test(u.hostname)) return false;
-    if (/^\/(overlay|popout|oauth2)/i.test(u.pathname)) return false;
-    return true;
-  } catch {
-    return false;
-  }
+function getNavGen(wc) {
+  return navGen.get(wc) || 0;
+}
+
+function bumpNavGen(wc) {
+  const next = getNavGen(wc) + 1;
+  navGen.set(wc, next);
+  return next;
 }
 
 function setupSessionHooks(ses) {
@@ -45,65 +49,82 @@ function setupSessionHooks(ses) {
   // 1) Script preload (écran de chargement immédiat + pont IPC)
   try {
     const preloadPath = path.resolve(__dirname, '../preload/index.js');
-    if (typeof ses.registerPreloadScript === 'function') {
-      ses.registerPreloadScript({ id: 'dreamcord-preload', type: 'frame', filePath: preloadPath });
-    } else if (typeof ses.setPreloads === 'function') {
-      const existing = ses.getPreloads ? ses.getPreloads() : [];
-      if (!existing.includes(preloadPath)) ses.setPreloads([...existing, preloadPath]);
+    if (fs.existsSync(preloadPath)) {
+      if (typeof ses.registerPreloadScript === 'function') {
+        const already =
+          typeof ses.getPreloadScripts === 'function' &&
+          ses.getPreloadScripts().some((s) => s && (s.id === 'dreamcord-preload' || s.filePath === preloadPath));
+        if (!already) {
+          ses.registerPreloadScript({ id: 'dreamcord-preload', type: 'frame', filePath: preloadPath });
+        }
+      } else if (typeof ses.setPreloads === 'function') {
+        const origSetPreloads = ses.setPreloads.bind(ses);
+        const ensurePreload = (list) => {
+          const arr = Array.isArray(list) ? list.slice() : [];
+          if (!arr.includes(preloadPath)) arr.push(preloadPath);
+          return origSetPreloads(arr);
+        };
+        const existing = ses.getPreloads ? ses.getPreloads() : [];
+        ensurePreload(existing);
+        // Empêche Discord d'écraser notre preload lors d'appels ultérieurs à setPreloads
+        ses.setPreloads = (preloads) => ensurePreload(preloads);
+      }
     }
   } catch (err) {
     logPatch('Preload: ' + err.message);
   }
 
-  // 2) Suppression de la CSP (nécessaire pour le serveur local du fond d'écran),
-  //    même si Discord remplace ensuite son propre écouteur.
+  // 2) Patch CSP (serveur local fond d'écran, traduction, Trusted Types),
+  //    même si Discord remplace/filtre ensuite son propre écouteur.
   try {
-    const orig = ses.webRequest.onHeadersReceived.bind(ses.webRequest);
-    orig((details, callback) => callback({ responseHeaders: common.stripCsp(details.responseHeaders) }));
-
-    ses.webRequest.onHeadersReceived = function (arg1, arg2) {
-      const hasFilter = typeof arg1 !== 'function' && arg1 !== null;
-      const listener = hasFilter ? arg2 : arg1;
-      if (!listener) return hasFilter ? orig(arg1, null) : orig(null);
-      const wrapped = (details, callback) =>
-        listener(details, (res) => {
-          if (res && res.responseHeaders) res = { ...res, responseHeaders: common.stripCsp(res.responseHeaders) };
-          callback(res);
-        });
-      return hasFilter ? orig(arg1, wrapped) : orig(wrapped);
-    };
+    common.installCspHook(ses);
   } catch (err) {
     logPatch('Hooks CSP: ' + err.message);
   }
 }
 
-async function injectIntoWindow(win, consoleHandler) {
+async function injectIntoWindow(win) {
   if (!win || win.isDestroyed()) return;
   const wc = win.webContents;
-  if (!isDiscordUrl(wc.getURL()) || injected.has(wc) || injecting.has(wc)) return;
-  injecting.add(wc);
+  if (!wc || wc.isDestroyed()) return;
+  if (!common.isDiscordUrl(wc.getURL())) return;
+
+  const gen = getNavGen(wc);
+  if (injectedGen.get(wc) === gen || injectingGen.get(wc) === gen) return;
+  injectingGen.set(wc, gen);
+
   try {
     const payload = await common.buildPayload();
-    if (win.isDestroyed()) return;
-    await wc.executeJavaScript(payload, true);
-    injected.add(wc);
+    if (win.isDestroyed() || wc.isDestroyed() || getNavGen(wc) !== gen) return;
+
+    const hasNative = await wc.executeJavaScript(`${payload}\nBoolean(window.DreamCordNative);`, true);
+    if (win.isDestroyed() || wc.isDestroyed() || getNavGen(wc) !== gen) return;
+    injectedGen.set(wc, gen);
 
     const config = common.getConfig();
     if (config.window?.material && config.window.material !== 'none') {
       common.applyWindowMaterial(win, config.window.material);
     }
-    if (!config.plugins?.['window-opacity']) {
-      try { win.setOpacity(1); } catch {}
+    if (config.window?.iconPath) {
+      common.applyWindowIcon(win, config.window.iconPath);
     }
-    // Si le pont natif (preload) fonctionne, on n'écoute plus la console de Discord.
-    if (consoleHandler) {
-      const native = await wc.executeJavaScript('Boolean(window.DreamCordNative)', true).catch(() => false);
-      if (native) wc.removeListener('console-message', consoleHandler);
+    common.applyTaskbarBadge(win, Boolean(config.window?.hideTaskbarBadge));
+    if (!config.plugins?.['window-opacity']) {
+      common.applyWindowOpacity(win, 1);
+    }
+
+    // Si le pont natif (preload) fonctionne, on retire le pont console de secours (zéro overhead)
+    if (hasNative) {
+      const handler = consoleHandlers.get(wc);
+      if (handler) {
+        wc.removeListener('console-message', handler);
+        consoleHandlers.delete(wc);
+      }
     }
   } catch (err) {
     logPatch('Injection: ' + (err?.stack || err?.message || err));
   } finally {
-    injecting.delete(wc);
+    if (injectingGen.get(wc) === gen) injectingGen.delete(wc);
   }
 }
 
@@ -121,7 +142,13 @@ function makeConsoleHandler(win) {
         wc.executeJavaScript(`window.__DREAMCORD_REPLY__&&window.__DREAMCORD_REPLY__(${Number(id)},${JSON.stringify(payload ?? null)})`, true).catch(() => {});
       };
       if (cmd === 'pick-wallpaper') wallpaperServer.pickFile(win).then(reply, () => reply(null));
-      else if (cmd === 'wallpaper-url') wallpaperServer.serveFile(data).then(reply, () => reply(null));
+      else if (cmd === 'wallpaper-url') {
+        const configured = common.getConfig().wallpaper?.filePath;
+        if (configured && data && path.resolve(String(data)) === path.resolve(String(configured))) {
+          wallpaperServer.allow(data);
+        }
+        wallpaperServer.serveFile(data).then(reply, () => reply(null));
+      } else if (cmd === 'pick-icon') common.pickIconFile(win).then(reply, () => reply(null));
       else common.runCommand(win, cmd, data);
     } catch (err) {
       logPatch('Pont console: ' + err.message);
@@ -137,20 +164,39 @@ function attachWindowHooks(win) {
 
   setupSessionHooks(wc.session);
 
+  if (common.getConfig().window?.hideTaskbarBadge) {
+    common.applyTaskbarBadge(win, true);
+  }
+
+  win.on('enter-full-screen', () => {
+    try {
+      const mat = common.getConfig().window?.material;
+      if (mat && mat !== 'none') common.applyWindowMaterial(win, 'none');
+    } catch {}
+  });
+  win.on('leave-full-screen', () => {
+    try {
+      const mat = common.getConfig().window?.material;
+      if (mat && mat !== 'none') setTimeout(() => !win.isDestroyed() && common.applyWindowMaterial(win, mat), 80);
+    } catch {}
+  });
+
   const consoleHandler = makeConsoleHandler(win);
+  consoleHandlers.set(wc, consoleHandler);
   wc.on('console-message', consoleHandler);
 
-  wc.on('did-start-loading', () => injected.delete(wc));
+  wc.on('did-start-loading', () => bumpNavGen(wc));
+  wc.on('render-process-gone', () => bumpNavGen(wc));
   // dom-ready = le plus tôt possible (fond + thème visibles vite) ; did-finish-load = filet de sécurité
-  wc.on('dom-ready', () => injectIntoWindow(win, consoleHandler));
-  wc.on('did-finish-load', () => injectIntoWindow(win, consoleHandler));
+  wc.on('dom-ready', () => injectIntoWindow(win));
+  wc.on('did-finish-load', () => injectIntoWindow(win));
 
   wc.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') return;
+    if (input.type !== 'keyDown' || input.isAutoRepeat || input.meta) return;
     const isF9 = input.key === 'F9' && !input.control && !input.alt && !input.shift;
     const isCtrlAltD = input.control && input.alt && !input.shift && input.key.toLowerCase() === 'd';
     if (!isF9 && !isCtrlAltD) return;
-    if (!isDiscordUrl(wc.getURL())) return;
+    if (!common.isDiscordUrl(wc.getURL())) return;
     event.preventDefault();
     wc.executeJavaScript('window.__DREAMCORD_TOGGLE_STUDIO__&&window.__DREAMCORD_TOGGLE_STUDIO__()', true).catch(() => {});
   });
@@ -161,11 +207,15 @@ if (app) {
 
   app.on('session-created', setupSessionHooks);
   app.on('browser-window-created', (_e, win) => attachWindowHooks(win));
-  app.on('before-quit', () => common.flushConfig());
+  app.on('before-quit', () => {
+    common.flushConfig();
+    common.closeWallpaperServer();
+  });
 
   app.whenReady().then(() => {
     try {
       common.registerIpc();
+      common.installTaskbarBadgeHook();
       setupSessionHooks(session.defaultSession);
       for (const win of BrowserWindow.getAllWindows()) {
         attachWindowHooks(win);
